@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import os
 
 # hyperparameters
 batch_size = 32  # how many independet sequences will we process in parallel
@@ -8,9 +9,15 @@ block_size = 8  # what is the maximum context length of the predictions
 max_iterations = 5000  # how many iterations will we train for
 eval_interval = 300  # how often will we evaluate the model
 learning_rate = 1e-3  # what is the learning rate
-device = 'cuda' if torch.cuda.is_available() else 'cpu'  # use the GPU if available
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'  # use the GPU if available
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'  # use MAC GPU if available
 eval_iters = 200  # how many iterations will we use for evaluation
 n_embd = 32  # No of embedding dimensions
+n_head = 4
+n_layer = 4
+dropout = 0.2
+# Path to save/load the model
+model_path = "bigram_language_model_complete.pth"
 # -----------------
 
 torch.manual_seed(1337)
@@ -67,6 +74,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -76,6 +84,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (B, T, C) @ ( B, C, T) = (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # mask out the upper half of the matrix
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
         # Perform the weighted aggregation of the values
         v = self.value(x)  # (B, T, C)
         out = wei @ v  # (B, T, T) @ (B, T, C) = (B, T, C)
@@ -89,10 +98,12 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
         self.projections = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.projections(out)
+        out = self.dropout(out)
         return out
 
 
@@ -101,9 +112,10 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -116,12 +128,14 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
-        self.sa_head = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
+        self.self_attention = MultiHeadAttention(n_head, head_size)
+        self.feed_fwd = FeedForward(n_embd)
+        self.layernorm1 = nn.LayerNorm(n_embd)
+        self.layernorm2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa_head(x)
-        x = x + self.ffwd(x)
+        x = x + self.self_attention(self.layernorm1(x))
+        x = x + self.feed_fwd(self.layernorm2(x))
         return x
 
 
@@ -132,13 +146,14 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-        )
-        # self.sa_head = MultiHeadAttention(n_heads=4, head_size=n_embd//4)  # i.e. 4 heads of 8 dimensional self-attention
-        # self.ffwd = FeedForward(n_embd)
+        # self.blocks = nn.Sequential(
+        #     Block(n_embd, n_head=4),
+        #     Block(n_embd, n_head=4),
+        #     Block(n_embd, n_head=4),
+        #     nn.LayerNorm(n_embd)
+        # )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.layer_norm_function = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -150,6 +165,7 @@ class BigramLanguageModel(nn.Module):
         position_embeddings = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
         x = token_embeddings + position_embeddings  # (B,T,C)
         x = self.blocks(x)  # Apply one head of self-attention. (B,T,C)
+        x = self.layer_norm_function(x)  # (B,T,C)
         logits = self.lm_head(x)  # (B,T,Voacb size)
 
         if targets is None:
@@ -185,27 +201,50 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-model = BigramLanguageModel()  # vocab_size is length of all unique characters in input text data
-m = model.to(device)
+# Add the class to the safe globals list
+torch.serialization.add_safe_globals([BigramLanguageModel])
 
-# create a PyTorch optimizer object
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# Check if the model file exists
+if os.path.exists(model_path):
+    # If model exists, load the model and optimizer state
+    print("Loading pre-trained model...")
+    model = torch.load(model_path, weights_only=False)  # Load the entire model if you saved the complete model
+    model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    # Optionally, load the optimizer state if you saved it
+    optimizer.load_state_dict(torch.load("optimizer.pth"))
+else:
+    # If model doesn't exist, initialize a new model
+    print("Initializing a new model...")
+    model = BigramLanguageModel().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-for iter in range(max_iterations):
+    def estimate_loss():
+        return {"train": 0.5, "val": 0.4}  # Dummy values, replace with actual loss estimation
 
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(f'Iter {iter:5d}, Train loss: {losses["train"]:.4f}, Val loss: {losses["val"]:.4f}')
+    # Training loop
+    for iter in range(max_iterations):
+        if iter % eval_interval == 0:
+            losses = estimate_loss()
+            print(f'Iter {iter:5d}, Train loss: {losses["train"]:.4f}, Val loss: {losses["val"]:.4f}')
 
-    # Sample a batch of data
-    xb, yb = get_batch('train')
+        # Sample a batch of data (you need to implement this function)
+        xb, yb = get_batch('train')  # Replace with your actual batch loading code
 
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+        # Evaluate the loss
+        logits, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    # After training, save the model
+    torch.save(model, model_path)  # Save the entire model (including architecture and parameters)
+    # Optionally, save optimizer state
+    torch.save(optimizer.state_dict(), "optimizer.pth")
+
+# Function for loss estimation (just an example, implement this as needed)
+
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
