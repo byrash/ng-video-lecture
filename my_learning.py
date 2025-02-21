@@ -88,9 +88,12 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.projections = nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.projections(out)
+        return out
 
 
 class FeedForward(nn.Module):
@@ -100,6 +103,7 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embd, n_embd),
             nn.ReLU(),
+            nn.Linear(n_embd, n_embd),
         )
 
     def forward(self, x):
@@ -116,8 +120,8 @@ class Block(nn.Module):
         self.ffwd = FeedForward(n_embd)
 
     def forward(self, x):
-        x = self.sa_head(x)
-        x = self.ffwd(x)
+        x = x + self.sa_head(x)
+        x = x + self.ffwd(x)
         return x
 
 
