@@ -219,9 +219,6 @@ else:
     model = BigramLanguageModel().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    def estimate_loss():
-        return {"train": 0.5, "val": 0.4}  # Dummy values, replace with actual loss estimation
-
     # Training loop
     for iter in range(max_iterations):
         if iter % eval_interval == 0:
